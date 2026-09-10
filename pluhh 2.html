@@ -1,0 +1,238 @@
+<html lang="en-us"><head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Unity WebGL Player | ULTRAKILL</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            height: 100%;
+            width: 100%;
+        }
+
+        #unity-container {
+            width: 100%;
+            height: 100%;
+            position: fixed;
+            top: 0;
+            left: 0;
+        }
+
+        #loading-screen {
+            position: fixed;
+            inset: 0;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #070707;
+            color: #f4f1ea;
+            font-family: Arial, Helvetica, sans-serif;
+        }
+
+        .loading-panel {
+            width: min(420px, calc(100% - 48px));
+        }
+
+        .loading-title {
+            margin: 0 0 14px;
+            font-size: clamp(28px, 7vw, 46px);
+            font-weight: 900;
+            letter-spacing: .08em;
+        }
+
+        .loading-status {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 10px;
+            color: #bcb7ae;
+            font-size: 14px;
+        }
+
+        .loading-track {
+            height: 12px;
+            overflow: hidden;
+            border: 1px solid #4c4943;
+            background: #191817;
+        }
+
+        #loading-bar {
+            width: 0;
+            height: 100%;
+            background: #e33226;
+            transition: width .12s linear;
+        }
+
+        #loading-detail {
+            min-height: 1.3em;
+            margin: 10px 0 0;
+            color: #817c74;
+            font-size: 12px;
+        }
+
+
+    </style>
+</head>
+
+<body style="text-align: center; padding: 0; border: 0; margin: 0;" marginwidth="0" marginheight="0">
+    
+    <canvas id="unity-canvas" tabindex="-1" width="900" height="506" style="width: 900px; height: 506px; cursor: default;"></canvas>
+    <script src="Build/ultrakill.loader.js"></script>
+    <script>
+        var canvas = document.querySelector("#unity-canvas");
+
+        if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+            // Mobile device style: fill the whole browser client area with the game canvas:
+            var meta = document.createElement('meta');
+            meta.name = 'viewport';
+            meta.content = 'width=device-width, height=device-height, initial-scale=1.0, user-scalable=no, shrink-to-fit=yes';
+            document.getElementsByTagName('head')[0].appendChild(meta);
+            canvas.style.width = "100%";
+            canvas.style.height = "100%";
+            canvas.style.position = "fixed";
+            document.body.style.textAlign = "left";
+        } else {
+            function resizeCanvas() {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+                canvas.style.width = window.innerWidth + "px";
+                canvas.style.height = window.innerHeight + "px";
+            }
+            resizeCanvas();
+            window.addEventListener('resize', resizeCanvas);
+        }
+
+        function getParts(file, start, end) {
+            let parts = [];
+            for (let i = start; i <= end; i++) {
+                parts.push(file + ".part" + i);
+            }
+            return parts;
+        }
+
+        const loadingScreen = document.querySelector("#loading-screen");
+        const loadingBar = document.querySelector("#loading-bar");
+        const loadingLabel = document.querySelector("#loading-label");
+        const loadingPercent = document.querySelector("#loading-percent");
+        const loadingDetail = document.querySelector("#loading-detail");
+        const assetProgress = new Map();
+
+        function formatBytes(bytes) {
+            if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " Ko";
+            return (bytes / (1024 * 1024)).toFixed(1) + " Mo";
+        }
+
+        function updateDownloadProgress() {
+            const files = Array.from(assetProgress.values());
+            const loaded = files.reduce((sum, file) => sum + file.loaded, 0);
+            const total = files.reduce((sum, file) => sum + file.total, 0);
+            const hasExactTotal = files.length > 0 && files.every((file) => file.total > 0);
+
+            if (!hasExactTotal) {
+                loadingDetail.textContent = "Téléchargement de " + files.length + " fichier(s)…";
+                return;
+            }
+
+            const percent = Math.min(100, Math.floor((loaded / total) * 100));
+            loadingBar.style.width = percent + "%";
+            loadingPercent.textContent = percent + "%";
+            loadingDetail.textContent = formatBytes(loaded) + " / " + formatBytes(total);
+        }
+
+        async function downloadAsset(url) {
+            const response = await fetch(url);
+            if (!response.ok) throw new Error("Impossible de télécharger " + url + " (HTTP " + response.status + ")");
+
+            const total = Number(response.headers.get("Content-Length")) || 0;
+            const progress = { loaded: 0, total: total };
+            assetProgress.set(url, progress);
+            updateDownloadProgress();
+
+            if (!response.body) {
+                const data = await response.arrayBuffer();
+                progress.loaded = data.byteLength;
+                progress.total = progress.total || data.byteLength;
+                updateDownloadProgress();
+                return data;
+            }
+
+            const reader = response.body.getReader();
+            const chunks = [];
+            while (true) {
+                const result = await reader.read();
+                if (result.done) break;
+                chunks.push(result.value);
+                progress.loaded += result.value.byteLength;
+                updateDownloadProgress();
+            }
+            progress.total = progress.total || progress.loaded;
+            updateDownloadProgress();
+            return new Blob(chunks).arrayBuffer();
+        }
+
+        const dataParts = getParts("Build/ultrakill.data.unityweb", 1, 4);
+        const wasmParts = getParts("Build/ultrakill.wasm.unityweb", 1, 2);
+        const frameworkFile = "Build/ultrakill.framework.js.unityweb";
+        const buildFiles = [...dataParts, ...wasmParts, frameworkFile];
+
+        function createFrameworkUrlWithPersistentSaves(frameworkData) {
+            const source = new TextDecoder().decode(frameworkData);
+            const marker = "unityFileSystemInit()})}var videoInputDevices";
+            const persistentSavesMount = "var ultrakillSaveUrl=new URL(\"../Saves\",location.href);var ultrakillSavePath=\"/\"+ultrakillSaveUrl.protocol.slice(0,-1)+\":/\"+ultrakillSaveUrl.host+ultrakillSaveUrl.pathname;var ultrakillSaveParts=ultrakillSavePath.split(\"/\");var ultrakillSaveCurrent=\"\";for(var ultrakillSaveIndex=1;ultrakillSaveIndex<ultrakillSaveParts.length;ultrakillSaveIndex++){ultrakillSaveCurrent+=\"/\"+ultrakillSaveParts[ultrakillSaveIndex];if(!FS.analyzePath(ultrakillSaveCurrent).exists)FS.mkdir(ultrakillSaveCurrent)}FS.mount(IDBFS,{autoPersist:true},ultrakillSavePath);unityFileSystemInit()})}var videoInputDevices";
+
+            if (!source.includes(marker)) {
+                throw new Error("The Unity runtime could not be prepared for persistent saves.");
+            }
+
+            return URL.createObjectURL(new Blob([source.replace(marker, persistentSavesMount)], {
+                type: "application/javascript"
+            }));
+        }
+
+        Promise.all(buildFiles.map(downloadAsset)).then((files) => {
+            const dataUrl = URL.createObjectURL(new Blob(files.slice(0, dataParts.length)));
+            const wasmurl = URL.createObjectURL(new Blob(files.slice(dataParts.length, dataParts.length + wasmParts.length)));
+            const frameworkUrl = createFrameworkUrlWithPersistentSaves(files[files.length - 1]);
+
+            loadingBar.style.width = "100%";
+            loadingPercent.textContent = "100%";
+            loadingLabel.textContent = "Assets loaded";
+            loadingDetail.textContent = "Loading Game…";
+            document.querySelector("#unity-canvas").hidden = false;
+            createUnityInstance(document.querySelector("#unity-canvas"), {
+                dataUrl: dataUrl,
+                frameworkUrl: frameworkUrl,
+                codeUrl: wasmurl,
+                streamingAssetsUrl: "StreamingAssets",
+                companyName: "Hakita and Cake Logic",
+                productName: "ULTRAKILL",
+                productVersion: "1.4",
+                // matchWebGLToCanvasSize: false, // Uncomment this to separately control WebGL canvas render size and DOM element size.
+                // devicePixelRatio: 1, // Uncomment this to override low DPI rendering on high DPI displays.
+            }, () => {
+                loadingDetail.textContent = "Loading Game…";
+            }).then(() => {
+                URL.revokeObjectURL(dataUrl);
+                URL.revokeObjectURL(wasmurl);
+                URL.revokeObjectURL(frameworkUrl);
+                loadingScreen.remove();
+            }).catch((error) => {
+                loadingLabel.textContent = "Erreur de chargement";
+                loadingPercent.textContent = "";
+                loadingDetail.textContent = error.message || "Loading Error, please refresh the page.";
+                console.error(error);
+            });
+        }).catch((error) => {
+            loadingLabel.textContent = "Erreur de téléchargement";
+            loadingPercent.textContent = "";
+            loadingDetail.textContent = error.message || "Loading Error, please refresh the page.";
+            console.error(error);
+        });
+    </script>
+
+
+
+<script src="blob:https://en.gameslol.net/b94c255d-5978-4f5e-811c-dd2ad7ee2ee3"></script></body></html>
